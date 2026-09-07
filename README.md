@@ -23,7 +23,7 @@ Features:
 
 - Omarchy 4.x (the picker runs inside `omarchy-shell`; tested on 4.0.2 / Hyprland 0.56)
 - At least one of: Google Chrome, Chromium, Brave, Firefox
-- `jq`, `wl-copy` (both ship with Omarchy)
+- `jq`, `wl-clipboard`, `uwsm`, `xdg-utils` (all ship with Omarchy); no sudo or pkexec is required
 
 ## Install
 
@@ -34,7 +34,8 @@ omarchy plugin add https://github.com/phiendp/browserhat.git
 
 The first command clones the plugin into the shell's plugin folder. The second enables it, symlinks
 the `browserhat` script into `~/.local/bin`, and registers it as the default `http`/`https` handler
-(`google-chrome-browserhat.desktop`). Nothing else on the system is modified.
+(`google-chrome-browserhat.desktop`) in `~/.config/mimeapps.list`. It records your previous default
+browser so uninstalling restores it. Nothing else on the system is modified.
 
 Tip: Chrome will nag that it is no longer the default browser. Add `--no-default-browser-check` to
 `~/.config/chrome-flags.conf` (and `chromium-flags.conf`) to silence it.
@@ -42,7 +43,7 @@ Tip: Chrome will nag that it is no longer the default browser. Add `--no-default
 To remove:
 
 ```sh
-~/.config/omarchy/plugins/io.github.phiendp.browserhat/uninstall.sh   # restores Chrome as default
+~/.config/omarchy/plugins/io.github.phiendp.browserhat/uninstall.sh   # restores your previous default browser
 omarchy plugin remove io.github.phiendp.browserhat
 ```
 

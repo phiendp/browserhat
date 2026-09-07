@@ -18,6 +18,13 @@ omarchy-shell shell rescanPlugins >/dev/null
 omarchy plugin list --json | jq -e --arg id "$PLUGIN_ID" 'any(.[]; .id == $id and .enabled)' >/dev/null \
   || omarchy plugin enable "$PLUGIN_ID"
 
+# Remember the current default browser so uninstall.sh can restore it.
+mkdir -p ~/.config/browserhat
+previous=$(env -u BROWSER xdg-settings get default-web-browser 2>/dev/null || true)
+if [[ -n $previous && $previous != google-chrome-browserhat.desktop ]]; then
+  printf '%s\n' "$previous" > ~/.config/browserhat/previous-default-browser
+fi
+
 mkdir -p ~/.local/bin ~/.local/share/applications
 ln -sf "$PLUGIN_DIR/browserhat" ~/.local/bin/browserhat
 install -m644 "$PLUGIN_DIR/google-chrome-browserhat.desktop" ~/.local/share/applications/google-chrome-browserhat.desktop

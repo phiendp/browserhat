@@ -88,10 +88,8 @@ discover_targets() {
 }
 
 # ---- launching --------------------------------------------------------------------
-detach() { # run a command detached from this process, like omarchy-launch-browser does
-  systemd-run --user --quiet --collect --unit="browserhat-$(date +%s%N)" \
-    --property=StandardOutput=null --property=StandardError=null \
-    uwsm-app -- "$@"
+detach() { # start a browser detached from this process (same approach as omarchy-launch-webapp)
+  setsid -f uwsm-app -- "$@" >/dev/null 2>&1
 }
 
 launch() { # <target-id> [browser-args...]   (for target "copy", the first arg is the URL)
