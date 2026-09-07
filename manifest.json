@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.phiendp.browserhat",
+  "name": "Browserhat",
+  "version": "0.1.0",
+  "author": "Phien Pham",
+  "license": "MIT",
+  "description": "Browser profile picker: choose which browser profile opens a link, with rules and hotkeys",
+  "kinds": ["overlay"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Browserhat.qml"
+  }
+}

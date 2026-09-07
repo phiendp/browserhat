@@ -1,0 +1,269 @@
+#!/bin/bash
+#
+# browserhat — a browser/profile picker for Omarchy (Hyprland).
+#
+# Registered as the default handler for http/https, so every link clicked in
+# Slack, terminals, email, etc. pops the Omarchy menu asking which browser
+# profile to open it in. Rules can route matching URLs straight to a target
+# without asking.
+#
+# Usage:
+#   browserhat [--incognito|--private] [URL]      pick a target (or apply a rule) and open URL
+#   browserhat list                               show discovered targets and their ids
+#   browserhat rules                              open the rules file in $EDITOR
+#   browserhat add-rule <ERE-pattern> <target-id> append a rule
+#   browserhat test <URL>                         show which rule/target a URL would resolve to
+#   browserhat --app=<URL>                        Omarchy web app launch: opens in $webapp_target, no picker
+#
+# Targets are discovered automatically from Chrome/Chromium "Local State" and
+# Firefox profiles.ini. Target ids look like:  chrome:Default, chrome:Profile 2,
+# chrome:incognito, chromium:Default, firefox:default-release, copy
+
+set -euo pipefail
+
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/browserhat
+RULES_FILE=$CONFIG_DIR/rules
+CONFIG_FILE=$CONFIG_DIR/config
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/browserhat
+LAST_FILE=$STATE_DIR/last-target
+
+# ---- user config (overridable in $CONFIG_FILE) --------------------------------
+strip_tracking=true     # drop utm_*, fbclid, gclid, ... from URLs before opening
+menu_width=560
+menu_maxheight=600
+offer_remember=true     # show the "Always open <host> in…" row in the picker
+webapp_target="chrome:Default"   # where Omarchy web apps (omarchy-launch-webapp --app=URL) open; no picker
+private_target="chrome:incognito" # where --private/--incognito launches go; no picker
+picker=auto             # auto | plugin | menu   (plugin = Browserhat overlay, menu = omarchy-menu-select)
+plugin_id=io.github.phiendp.browserhat
+# Extra targets not derivable from browser profiles, "id|glyph|label|subtext".
+extra_targets=()
+# ---------------------------------------------------------------------------------
+
+mkdir -p "$CONFIG_DIR" "$STATE_DIR"
+[[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
+[[ -f $RULES_FILE ]] || cat > "$RULES_FILE" <<'RULES'
+# browserhat rules — one per line:  <extended-regex matched against the URL>  <target-id>
+# The first matching rule wins and the picker is skipped. `browserhat list` shows target ids.
+# Examples:
+#   ^https?://([^/]*\.)?atlassian\.net/     chrome:Profile 2
+#   ^https?://([^/]*\.)?github\.com/         chrome:Default
+#   ^https?://(www\.)?youtube\.com/          chrome:incognito
+RULES
+
+# ---- target discovery -------------------------------------------------------------
+# Each target is emitted as:  id<TAB>glyph<TAB>label<TAB>subtext
+TARGETS=()   # ids, in display order
+declare -A T_GLYPH T_LABEL T_SUB T_AVATAR
+
+add_target() { # id glyph label subtext [avatar-path]
+  TARGETS+=("$1"); T_GLYPH[$1]=$2; T_LABEL[$1]=$3; T_SUB[$1]=${4:-}; T_AVATAR[$1]=${5:-}
+}
+
+chromium_profiles() { # <browser-id> <glyph> <pretty-name> <config-dir>
+  local id=$1 glyph=$2 pretty=$3 dir=$4 state="$4/Local State"
+  [[ -f $state ]] || return 0
+  while IFS=$'\t' read -r key name user; do
+    local avatar="$dir/$key/Google Profile Picture.png"; [[ -f $avatar ]] || avatar=""
+    add_target "$id:$key" "$glyph" "$name" "$pretty · ${user:-$key}" "$avatar"
+  done < <(jq -r '.profile.info_cache | to_entries[] | [.key, (.value.name // .key), (.value.user_name // "")] | @tsv' "$state")
+}
+
+firefox_profiles() { # <browser-id> <glyph> <pretty-name> <ini>
+  local id=$1 glyph=$2 pretty=$3 ini=$4
+  [[ -f $ini ]] || return 0
+  awk -F= '/^\[Profile/{n=""} /^Name=/{print $2}' "$ini" | while read -r name; do
+    add_target "$id:$name" "$glyph" "$name" "$pretty"
+  done
+}
+
+discover_targets() {
+  command -v google-chrome-stable >/dev/null && chromium_profiles chrome  "" "Chrome"   ~/.config/google-chrome
+  command -v chromium             >/dev/null && chromium_profiles chromium "" "Chromium" ~/.config/chromium
+  command -v brave                >/dev/null && chromium_profiles brave   "" "Brave"    ~/.config/BraveSoftware/Brave-Browser
+  command -v firefox              >/dev/null && firefox_profiles firefox  "" "Firefox"  ~/.mozilla/firefox/profiles.ini
+  command -v google-chrome-stable >/dev/null && add_target "chrome:incognito" "󰗹" "Incognito" "Chrome · private window"
+  for t in "${extra_targets[@]}"; do IFS='|' read -r id glyph label sub <<<"$t"; add_target "$id" "$glyph" "$label" "$sub"; done
+  add_target "copy" "" "Copy link" "wl-copy"
+}
+
+# ---- launching --------------------------------------------------------------------
+detach() { # run a command detached from this process, like omarchy-launch-browser does
+  systemd-run --user --quiet --collect --unit="browserhat-$(date +%s%N)" \
+    --property=StandardOutput=null --property=StandardError=null \
+    uwsm-app -- "$@"
+}
+
+launch() { # <target-id> [browser-args...]   (for target "copy", the first arg is the URL)
+  local id=$1; shift
+  local browser=${id%%:*} profile=${id#*:} class
+  case $browser in
+    chrome)   class=google-chrome
+      if [[ $profile == incognito ]]; then detach google-chrome-stable --incognito "$@"
+      else detach google-chrome-stable --profile-directory="$profile" "$@"; fi ;;
+    chromium) class=chromium; detach chromium --profile-directory="$profile" "$@" ;;
+    brave)    class=brave;    detach brave    --profile-directory="$profile" "$@" ;;
+    firefox)  class=firefox
+      if [[ $private == true ]]; then detach firefox -P "$profile" --private-window "$@"
+      else detach firefox -P "$profile" ${1:+--new-tab} "$@"; fi ;;
+    copy)     printf '%s' "${1:-}" | wl-copy; notify-send -a browserhat "Link copied" "${1:-}" 2>/dev/null || true; return 0 ;;
+    *)        echo "browserhat: unknown target '$id'" >&2; return 1 ;;
+  esac
+  printf '%s\n' "$id" > "$LAST_FILE"
+  # Chrome/Chromium open a tab in an existing window; bring it to the front.
+  if [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} && -n ${class:-} ]]; then
+    sleep 0.3; omarchy-hyprland-focus-app "^$class$" 2>/dev/null || true
+  fi
+}
+
+# ---- URL helpers ------------------------------------------------------------------
+clean_url() {
+  local url=$1
+  [[ $strip_tracking == true ]] || { printf '%s' "$url"; return; }
+  # Remove common tracking params; keep everything else untouched.
+  local base=${url%%\?*} query='' frag=''
+  [[ $url == *\?* ]] && query=${url#*\?} && query=${query%%#*}
+  [[ $url == *#* ]] && frag="#${url#*#}"
+  if [[ -n $query ]]; then
+    query=$(tr '&' '\n' <<<"$query" | grep -Ev '^(utm_[a-z]+|fbclid|gclid|dclid|msclkid|mc_[a-z]+|igshid|si|ref_src|_hsenc|_hsmi|vero_id|yclid|wickedid|oly_[a-z_]+|s_cid|mkt_tok)=' | paste -sd '&' - || true)
+  fi
+  printf '%s%s%s' "$base" "${query:+?$query}" "$frag"
+}
+
+url_host() { local h=${1#*://}; h=${h%%/*}; h=${h%%\?*}; h=${h#*@}; printf '%s' "${h%%:*}"; }
+
+match_rule() { # <url> -> prints target id of first matching rule
+  local pattern target
+  while read -r pattern target; do   # target may contain spaces ("chrome:Profile 2")
+    [[ -z $pattern || $pattern == \#* ]] && continue
+    if [[ $1 =~ $pattern ]]; then printf '%s' "$target"; return 0; fi
+  done < "$RULES_FILE"
+  return 1
+}
+
+# ---- picker -----------------------------------------------------------------------
+# Two UIs share one contract: print "<target-id>" (and set REMEMBER=1 when the user
+# asked to remember the domain), exit 1 on cancel.
+REMEMBER=0
+
+plugin_pick() { # <url> <host> [ids...] -> chosen id via the Browserhat overlay plugin
+  local url=$1 host=$2; shift 2
+  local sel done_f payload out
+  sel=$(mktemp) && done_f=$(mktemp) && rm -f "$done_f"
+  trap 'rm -f "$sel" "$done_f"' RETURN
+  payload=$(for id in "$@"; do
+      jq -nc --arg id "$id" --arg label "${T_LABEL[$id]}" --arg sub "${T_SUB[$id]}" \
+             --arg glyph "${T_GLYPH[$id]}" --arg avatar "${T_AVATAR[$id]}" \
+             '{id:$id,label:$label,sub:$sub,glyph:$glyph,avatar:$avatar}'
+    done | jq -sc --arg url "$url" --arg host "$host" --arg sel "$sel" --arg done "$done_f" \
+             --argjson remember "$([[ $offer_remember == true && -n $url ]] && echo true || echo false)" \
+             '{url:$url,host:$host,targets:.,selectionFile:$sel,doneFile:$done,remember:$remember}')
+  out=$(omarchy-shell shell summon "$plugin_id" "$payload" 2>/dev/null) || return 2
+  [[ $out == ok || $out == true ]] || return 2      # plugin unknown/disabled -> caller falls back
+  local waited=0
+  while [[ ! -e $done_f ]]; do sleep 0.05; waited=$((waited+1)); (( waited < 6000 )) || return 1; done
+  [[ -s $sel ]] || return 1
+  local id flag; IFS=$'\t' read -r id flag < "$sel"
+  [[ -n ${T_LABEL[$id]:-} ]] || return 1
+  [[ $flag == 1 ]] && REMEMBER=1
+  printf '%s' "$id"
+}
+
+menu_row() { printf '%s\t%s\t%s' "${T_GLYPH[$1]}" "${T_LABEL[$1]}" "${T_SUB[$1]}"; }
+
+menu_pick() { # <prompt> [ids...] -> chosen id via omarchy-menu-select (exit 1 on cancel)
+  local prompt=$1; shift
+  local -a rows; local -A by_key; local id key
+  for id in "$@"; do
+    key="${T_LABEL[$id]}"$'\t'"${T_SUB[$id]}"
+    by_key[$key]=$id; rows+=("$(menu_row "$id")")
+  done
+  local choice
+  choice=$(omarchy-menu-select "$prompt" "${rows[@]}" -- --width "$menu_width" --maxheight "$menu_maxheight") || return 1
+  [[ -n ${by_key[$choice]:-} ]] && printf '%s' "${by_key[$choice]}"
+}
+
+shell_available() { omarchy-shell shell call omarchy.menu ping '{}' >/dev/null 2>&1; }
+
+add_rule_for_host() { # <host> <target-id>
+  local esc; esc=$(sed 's/\./\\./g' <<<"$1")
+  printf '^https?://([^/]*\\.)?%s/  %s\n' "$esc" "$2" >> "$RULES_FILE"
+  notify-send -a browserhat "Rule added" "$1 → ${T_LABEL[$2]} (${T_SUB[$2]})" 2>/dev/null || true
+}
+
+# ---- subcommands ------------------------------------------------------------------
+private=false
+url=''
+app_url=''
+passthru=()
+case ${1:-} in
+  -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  list)
+    discover_targets
+    for id in "${TARGETS[@]}"; do printf '%-22s %s  %s\n' "$id" "${T_LABEL[$id]}" "${T_SUB[$id]}"; done; exit 0 ;;
+  rules) exec "${EDITOR:-nvim}" "$RULES_FILE" ;;
+  add-rule)
+    [[ $# -eq 3 ]] || { echo "usage: browserhat add-rule <pattern> <target-id>" >&2; exit 1; }
+    printf '%s  %s\n' "$2" "$3" >> "$RULES_FILE"; echo "added: $2 → $3"; exit 0 ;;
+  test)
+    [[ $# -eq 2 ]] || { echo "usage: browserhat test <url>" >&2; exit 1; }
+    u=$(clean_url "$2"); echo "url:    $u"
+    if t=$(match_rule "$u"); then echo "rule →  $t"; else echo "rule →  (none; picker would open)"; fi; exit 0 ;;
+esac
+
+for arg in "$@"; do
+  case $arg in
+    --incognito|--private|--private-window|--inprivate) private=true ;;
+    --app=*) app_url=${arg#--app=} ;;   # Omarchy web app launch
+    -*) passthru+=("$arg") ;;           # other browser flags: forwarded untouched
+    *) [[ -z $url ]] && url=$arg ;;
+  esac
+done
+
+[[ -n $url ]] && url=$(clean_url "$url")
+
+# Resolve a configured target id to one that exists on this machine.
+resolve_target() { # <preferred-id> -> prints an existing target id
+  [[ ${#TARGETS[@]} -gt 0 ]] || discover_targets
+  if [[ -n ${T_LABEL[$1]:-} ]]; then printf '%s' "$1"; return; fi
+  for id in "${TARGETS[@]}"; do [[ $id != copy ]] && { printf '%s' "$id"; return; }; done
+  return 1
+}
+
+# Web apps (omarchy-launch-webapp) go straight to the configured profile.
+if [[ -n $app_url ]]; then launch "$(resolve_target "$webapp_target")" --app="$app_url" "${passthru[@]}"; exit 0; fi
+
+# Private window requested (e.g. Omarchy's Super+Shift+Return): go straight to a private window.
+if [[ $private == true ]]; then launch "$(resolve_target "$private_target")" ${url:+"$url"} "${passthru[@]}"; exit 0; fi
+
+# Rules first — matching links never show the picker.
+if [[ -n $url ]] && target=$(match_rule "$url"); then launch "$target" "$url" "${passthru[@]}"; exit 0; fi
+
+[[ ${#TARGETS[@]} -gt 0 ]] || discover_targets
+
+host=""; [[ -n $url ]] && host=$(url_host "$url")
+
+# Fallback when the Omarchy shell is down entirely: last target, else the first one.
+if ! shell_available; then
+  fallback=$(cat "$LAST_FILE" 2>/dev/null || true)
+  [[ -n $fallback && -n ${T_LABEL[$fallback]:-} ]] || fallback=${TARGETS[0]}
+  launch "$fallback" ${url:+"$url"} "${passthru[@]}"; exit 0
+fi
+
+choice=""
+if [[ $picker != menu ]]; then
+  choice=$(plugin_pick "$url" "$host" "${TARGETS[@]}"); rc=$?
+  (( rc == 1 )) && exit 0                                 # cancelled in the overlay: drop the link
+  (( rc == 2 )) && [[ $picker == plugin ]] && { echo "browserhat: plugin $plugin_id is not enabled" >&2; exit 1; }
+fi
+if [[ -z $choice ]]; then                                  # menu fallback (plugin missing/disabled)
+  [[ $offer_remember == true && -n $url ]] && add_target "__remember" "󰆓" "Always open $host in…" "adds a rule, then opens"
+  choice=$(menu_pick "${host:+Open $host in…}${host:-Open in…}" "${TARGETS[@]}") || exit 0
+  if [[ $choice == "__remember" ]]; then
+    choice=$(menu_pick "Always open $host in…" "${TARGETS[@]::${#TARGETS[@]}-1}") || exit 0
+    REMEMBER=1
+  fi
+fi
+
+[[ $REMEMBER == 1 && -n $host ]] && add_rule_for_host "$host" "$choice"
+launch "$choice" ${url:+"$url"} "${passthru[@]}"
